@@ -1,0 +1,643 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+甲骨文多模态模型统一评测脚本
+- 专门面向甲骨文相关任务
+- 支持多模型、多任务
+- 自动构造甲骨文领域 prompt
+"""
+
+import os
+import json
+from argparse import ArgumentParser
+from typing import List, Dict, Any, Optional
+
+import torch
+from tqdm import tqdm
+from PIL import Image
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from swift.llm import (
+    get_model_tokenizer, get_template, inference_stream, ModelType,
+    get_default_template_type
+)
+from swift.utils import seed_everything
+
+# ====================== 全局配置 ======================
+
+DEVICE = "cuda"
+
+MODEL_PATH_MAP = {
+    "Qwen2-VL-2B-Instruct": "/home/gpuall/ifs_data/pre_llms/Qwen2/Qwen2-VL-2B-Instruct",
+    "Qwen2-VL-7B-Instruct": "/home/gpuall/ifs_data/pre_llms/Qwen2/Qwen2-VL-7B-Instruct",
+    "MiniCPM-V-2_5": "/home/gpuall/ifs_data/pre_llms/MiniCPM-Llama3-V-2_5",
+    "MiniCPM-V-2.6": "/home/gpuall/ifs_data/pre_llms/MiniCPM-V-2_6",
+    "InternVL-chat-1.5": "/home/gpuall/ifs_data/pre_llms/InternVL-Chat-V1-5",
+    "InternVL-2.0": "/home/gpuall/ifs_data/pre_llms/InternVL2-8B",
+    "Yi-VL-6B": "/home/gpuall/ifs_data/pre_llms/Yi-VL-6B/Yi-VL-6B",
+    "glm-4v-9b": "/home/gpuall/ifs_data/pre_llms/ZhipuAI/glm-4v-9b",
+}
+
+# 这里改成甲骨文相关任务
+TASKS_LIST = [
+    "甲骨文释读翻译",         # 将甲骨文/古汉语翻译为现代汉语
+    "甲骨文字形识别转写",     # 图像中的甲骨文字形 -> 今文字/Unicode/编号
+    "甲骨文字义解释",         # 解释单字或短语含义
+    "甲骨文图文一致性判断",   # 拓片/字形 与 释文/解释 是否一致
+]
+
+PROMPT_TYPE_LIST = ["0_shot", "5_shot", "chain_of_thought"]
+
+
+# ====================== 工具函数 ======================
+
+def read_json(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"{path} 中的顶层结构不是 list，请检查数据格式。")
+    return data
+
+
+def save_as_jsonl(path: str, responses: List[str], data: List[Dict[str, Any]]) -> None:
+    if len(responses) != len(data):
+        raise ValueError(f"responses 数量({len(responses)}) 与 data 数量({len(data)}) 不一致。")
+
+    with open(path, "w", encoding="utf-8") as fp:
+        for sample, pred in zip(data, responses):
+            one = {
+                "instruction": sample.get("instruction", ""),
+                "text": sample.get("input", ""),
+                "raw": sample.get("output", ""),
+                "predicate": pred,
+            }
+            json_str = json.dumps(one, ensure_ascii=False)
+            fp.write(json_str + "\n")
+
+
+def create_directory(directory_path: str) -> None:
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path, exist_ok=True)
+        print(f"文件夹 '{directory_path}' 创建成功。")
+    else:
+        print(f"文件夹 '{directory_path}' 已经存在。")
+
+
+def get_args():
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        required=True,
+        choices=list(MODEL_PATH_MAP.keys()),
+        help="模型名称（需在 MODEL_PATH_MAP 中配置）。",
+    )
+    parser.add_argument(
+        "--task_name",
+        type=str,
+        required=True,
+        choices=TASKS_LIST,
+        help="甲骨文任务名称。",
+    )
+    parser.add_argument(
+        "--prompt_type",
+        type=str,
+        required=True,
+        choices=PROMPT_TYPE_LIST,
+        help="prompt 类型：0_shot / 5_shot / chain_of_thought。",
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        required=True,
+        help="数据 JSON 路径（list 格式）。",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="只评测前 N 条样本（None 表示使用全部）。",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="result",
+        help="结果输出根目录。",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="生成的最大 token 数。",
+    )
+    args = parser.parse_args()
+    return args
+
+
+# ====================== 主类 ======================
+
+class ChatModelProcess:
+    """
+    甲骨文评测统一入口
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        task_name: str,
+        prompt_type: str,
+        data_path: str,
+        sample: Optional[int],
+        max_new_tokens: int = 512,
+    ):
+        if model_name not in MODEL_PATH_MAP:
+            raise ValueError(f"未知模型名: {model_name}")
+
+        self.model_name = model_name
+        self.task_name = task_name
+        self.prompt_type = prompt_type
+        self.data_path = data_path
+        self.check_point = MODEL_PATH_MAP[model_name]
+        self.max_new_tokens = max_new_tokens
+
+        data_all = read_json(path=data_path)
+        if sample is None or sample >= len(data_all):
+            self.data = data_all
+        else:
+            self.data = data_all[:sample]
+        self.used_data = self.data
+
+        seed_everything(42)
+
+    # ===== prompt 设计：专门针对甲骨文四个任务 =====
+    def build_prompt(self, instruction: str, user_input: str) -> str:
+        """
+        根据 task_name / prompt_type 构造“甲骨文领域”的提示。
+        instruction / input 通常来自数据集，这里包一层领域说明。
+        """
+        base = instruction + user_input
+
+        if self.task_name == "甲骨文释读翻译":
+            prefix = (
+                "你是一名精通甲骨文和上古汉语的学者。"
+                "请根据给定的甲骨文材料（可能是文字转写或图像对应的释文），"
+                "将其翻译为准确、流畅的现代汉语（简体），保留专有名词。"
+                "\n\n"
+            )
+            suffix = (
+                "\n\n请按以下格式输出：\n"
+                "【今文翻译】...\n"
+                "【说明】简要说明关键语汇或字形的理解依据（可选）。"
+            )
+        elif self.task_name == "甲骨文字形识别转写":
+            prefix = (
+                "你是一名甲骨文字形与字库编码专家。"
+                "请根据给定的甲骨文字形（或其文字描述），"
+                "识别出对应的今文字或标准转写形式，可以给出常用字形名称、"
+                "甲骨文字编号（如丙编号/合集号，如已知）或 Unicode 编码（如有）。"
+                "\n\n"
+            )
+            suffix = (
+                "\n\n请按以下格式输出：\n"
+                "【转写】...\n"
+                "【补充】若存在多种可能，请按可能性从高到低列出。"
+            )
+        elif self.task_name == "甲骨文字义解释":
+            prefix = (
+                "你是一名研究殷商甲骨文的字义学者。"
+                "请对给定的甲骨文字或短语进行含义解释，"
+                "说明其在殷商占卜语境中的大致用法、核心语义，以及与后世汉字的关系。"
+                "\n\n"
+            )
+            suffix = (
+                "\n\n请按以下格式输出：\n"
+                "【基本义】...\n"
+                "【语境用法】...\n"
+                "【与后世汉字关系】（可选）..."
+            )
+        elif self.task_name == "甲骨文图文一致性判断":
+            prefix = (
+                "你是一名甲骨文图像与释文校勘专家。"
+                "已给出甲骨文相关图像或字形信息，以及对应的释文/翻译/解释。"
+                "请判断二者在字形和语义上是否一致，并指出可能的错配或疏漏。"
+                "\n\n"
+            )
+            suffix = (
+                "\n\n请按以下格式输出：\n"
+                "【一致性判断】一致 / 基本一致 / 不一致\n"
+                "【理由】简要说明依据，例如具体字形特征、词语搭配、语义是否匹配等。"
+            )
+        else:
+            prefix = ""
+            suffix = ""
+
+        prompt = prefix + base + suffix
+
+        if self.prompt_type == "0_shot":
+            return prompt
+        elif self.prompt_type == "5_shot":
+            # TODO: 如果你有现成的 5-shot 示例，可以在这里拼接 few-shot 样本
+            # 目前占位，先直接返回领域 prompt
+            return prompt
+        elif self.prompt_type == "chain_of_thought":
+            return prompt + "\n\n请给出逐步推理过程，再得出最终结论。"
+        else:
+            return prompt
+
+    # ===== 图像读取 =====
+    @staticmethod
+    def _get_images_from_item(item: Dict[str, Any]) -> List[Image.Image]:
+        image_paths = item.get("images", [])
+        if not image_paths:
+            return []
+        if not isinstance(image_paths, list):
+            raise ValueError("样本中的 `images` 字段应为 list。")
+
+        images: List[Image.Image] = []
+        for p in image_paths:
+            if os.path.exists(p):
+                try:
+                    img = Image.open(p).convert("RGB")
+                    images.append(img)
+                except Exception as e:
+                    print(f"[警告] 打开图片 {p} 失败：{e}")
+            else:
+                print(f"[警告] 图片路径不存在：{p}")
+        return images
+
+    # ===================== 各模型调用（只改文案，不改 API 逻辑） =====================
+
+    def _qwen2_vl_7b(self) -> List[str]:
+        print("开始调用 Qwen2-VL-7B-Instruct（甲骨文任务）")
+        model_type = ModelType.qwen2_vl_7b_instruct
+        template_type = get_default_template_type(model_type)
+        print(f"template_type: {template_type}")
+
+        model, tokenizer = get_model_tokenizer(
+            model_type,
+            torch.bfloat16,
+            model_id_or_path=self.check_point,
+            model_kwargs={"device_map": "auto"},
+        )
+        model.generation_config.max_new_tokens = self.max_new_tokens
+        template = get_template(template_type, tokenizer)
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            images = self._get_images_from_item(item)
+
+            # 对多模态模型强调“图像为甲骨文拓片/字形”
+            if images:
+                query = "<image>以下图像为甲骨文拓片或字形，请结合图像和文字完成任务。\n\n" + prompt
+            else:
+                query = prompt
+
+            gen = inference_stream(model, template, query, images=images or None)
+
+            print_idx = 0
+            print(f"query: {query}\nresponse: ", end="", flush=True)
+            response_text = ""
+
+            for resp, _ in gen:
+                delta = resp[print_idx:]
+                print(delta, end="", flush=True)
+                response_text += delta
+                print_idx = len(resp)
+
+            print()
+            responses.append(response_text)
+
+        return responses
+
+    def _qwen2_vl_2b(self) -> List[str]:
+        print("开始调用 Qwen2-VL-2B-Instruct（甲骨文任务）")
+        try:
+            model_type = ModelType.qwen2_vl_2b_instruct
+        except AttributeError:
+            model_type = ModelType.qwen2_vl_7b_instruct
+
+        template_type = get_default_template_type(model_type)
+        print(f"template_type: {template_type}")
+
+        model, tokenizer = get_model_tokenizer(
+            model_type,
+            torch.bfloat16,
+            model_id_or_path=self.check_point,
+            model_kwargs={"device_map": "auto"},
+        )
+        model.generation_config.max_new_tokens = self.max_new_tokens
+        template = get_template(template_type, tokenizer)
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            images = self._get_images_from_item(item)
+            if images:
+                query = "<image>以下图像为甲骨文拓片或字形，请结合图像和文字完成任务。\n\n" + prompt
+            else:
+                query = prompt
+
+            gen = inference_stream(model, template, query, images=images or None)
+
+            print_idx = 0
+            print(f"query: {query}\nresponse: ", end="", flush=True)
+            response_text = ""
+
+            for resp, _ in gen:
+                delta = resp[print_idx:]
+                print(delta, end="", flush=True)
+                response_text += delta
+                print_idx = len(resp)
+
+            print()
+            responses.append(response_text)
+
+        return responses
+
+    def _minicpm(self) -> List[str]:
+        print("开始调用 MiniCPM 系列模型（甲骨文文本任务）")
+        model = AutoModelForCausalLM.from_pretrained(
+            self.check_point,
+            torch_dtype=torch.float16,
+            device_map={"": "cuda:0"},
+            trust_remote_code=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.check_point, trust_remote_code=True
+        )
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            messages = [
+                {
+                    "role": "system",
+                    "content": "你是一名精通甲骨文、金文与上古汉语的专家，擅长释读与考释甲骨文资料。",
+                },
+                {"role": "user", "content": prompt},
+            ]
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            model_inputs = tokenizer([text], return_tensors="pt").to(DEVICE)
+
+            generated_ids = model.generate(
+                model_inputs.input_ids, max_new_tokens=self.max_new_tokens
+            )
+            generated_ids = [
+                output_ids[len(input_ids):]
+                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            response = tokenizer.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
+            responses.append(response)
+
+        return responses
+
+    def _internvl_chat_1_5(self) -> List[str]:
+        print("开始调用 InternVL-chat-1.5（甲骨文任务）")
+        model_type = "internvl-chat-v1_5"
+        template_type = get_default_template_type(model_type)
+        print(f"template_type: {template_type}")
+
+        model, tokenizer = get_model_tokenizer(
+            model_type,
+            torch.bfloat16,
+            model_id_or_path=self.check_point,
+            model_kwargs={"device_map": "auto"},
+        )
+        model.generation_config.max_new_tokens = self.max_new_tokens
+        template = get_template(template_type, tokenizer)
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            images = self._get_images_from_item(item)
+
+            if images:
+                query = "<image>以下图像为甲骨文拓片或字形，请结合图像和说明完成甲骨文相关任务。\n\n" + prompt
+            else:
+                query = prompt
+
+            gen = inference_stream(model, template, query, images=images or None)
+
+            print_idx = 0
+            print(f"query: {query}\nresponse: ", end="", flush=True)
+            response_text = ""
+
+            for resp, _ in gen:
+                delta = resp[print_idx:]
+                print(delta, end="", flush=True)
+                response_text += delta
+                print_idx = len(resp)
+
+            print()
+            responses.append(response_text)
+
+        return responses
+
+    def _internvl_2(self) -> List[str]:
+        print("开始调用 InternVL-2.0（甲骨文任务）")
+        model_type = "internvl2-8b"
+        template_type = get_default_template_type(model_type)
+        print(f"template_type: {template_type}")
+
+        model, tokenizer = get_model_tokenizer(
+            model_type,
+            torch.bfloat16,
+            model_id_or_path=self.check_point,
+            model_kwargs={"device_map": "auto"},
+        )
+        model.generation_config.max_new_tokens = self.max_new_tokens
+        template = get_template(template_type, tokenizer)
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            images = self._get_images_from_item(item)
+            if images:
+                query = "<image>下图为甲骨文拓片或局部字形，请结合图像信息完成任务。\n\n" + prompt
+            else:
+                query = prompt
+
+            gen = inference_stream(model, template, query, images=images or None)
+
+            print_idx = 0
+            print(f"query: {query}\nresponse: ", end="", flush=True)
+            response_text = ""
+
+            for resp, _ in gen:
+                delta = resp[print_idx:]
+                print(delta, end="", flush=True)
+                response_text += delta
+                print_idx = len(resp)
+
+            print()
+            responses.append(response_text)
+
+        return responses
+
+    def _yi_vl_6b(self) -> List[str]:
+        print("开始调用 Yi-VL-6B（甲骨文任务）")
+        model_type = ModelType.yi_vl_6b_chat
+        template_type = get_default_template_type(model_type)
+        print(f"template_type: {template_type}")
+
+        model, tokenizer = get_model_tokenizer(
+            model_type,
+            torch.bfloat16,
+            model_id_or_path=self.check_point,
+            model_kwargs={"device_map": "auto"},
+        )
+        model.generation_config.max_new_tokens = self.max_new_tokens
+        template = get_template(template_type, tokenizer)
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            images = self._get_images_from_item(item)
+            if images:
+                query = "<image>下图为甲骨文相关图像，请结合图像与文字信息完成释读或判断。\n\n" + prompt
+            else:
+                query = prompt
+
+            gen = inference_stream(model, template, query, images=images or None)
+
+            print_idx = 0
+            print(f"query: {query}\nresponse: ", end="", flush=True)
+            response_text = ""
+
+            for resp, _ in gen:
+                delta = resp[print_idx:]
+                print(delta, end="", flush=True)
+                response_text += delta
+                print_idx = len(resp)
+
+            print()
+            responses.append(response_text)
+
+        return responses
+
+    def _glm_4v_9b(self) -> List[str]:
+        print("开始调用 GLM-4V-9B（甲骨文任务）")
+        model = AutoModelForCausalLM.from_pretrained(
+            self.check_point,
+            torch_dtype=torch.float16,
+            device_map={"": "cuda:0"},
+            trust_remote_code=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.check_point, trust_remote_code=True
+        )
+
+        responses: List[str] = []
+        for item in tqdm(self.data):
+            prompt = self.build_prompt(item.get("instruction", ""), item.get("input", ""))
+            image_paths = item.get("images", [])
+
+            image = None
+            if isinstance(image_paths, list) and len(image_paths) > 0:
+                p = image_paths[0]
+                if os.path.exists(p):
+                    try:
+                        image = Image.open(p).convert("RGB")
+                    except Exception as e:
+                        print(f"[警告] 打开图片 {p} 失败：{e}")
+
+            if image is not None:
+                chat = [{
+                    "role": "user",
+                    "image": image,
+                    "content": "下面的图像为甲骨文拓片或字形，请结合图像信息完成甲骨文相关任务。\n\n" + prompt,
+                }]
+            else:
+                chat = [{
+                    "role": "user",
+                    "content": "以下是甲骨文相关的文字任务，请完成：\n\n" + prompt,
+                }]
+
+            inputs = tokenizer.apply_chat_template(
+                chat,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+
+            inputs = {
+                k: v.to("cuda:0")
+                for k, v in inputs.items()
+                if isinstance(v, torch.Tensor)
+            }
+
+            gen_kwargs = {
+                "max_length": self.max_new_tokens + inputs["input_ids"].shape[1],
+                "do_sample": True,
+                "top_k": 1,
+            }
+
+            with torch.no_grad():
+                outputs = model.generate(**inputs, **gen_kwargs)
+                outputs = outputs[:, inputs["input_ids"].shape[1]:]
+                decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+            responses.append(decoded)
+
+        return responses
+
+    # ===================== 路由入口 =====================
+
+    def run(self) -> List[str]:
+        model_to_method = {
+            "Qwen2-VL-2B-Instruct": self._qwen2_vl_2b,
+            "Qwen2-VL-7B-Instruct": self._qwen2_vl_7b,
+            "MiniCPM-V-2_5": self._minicpm,
+            "MiniCPM-V-2.6": self._minicpm,
+            "InternVL-chat-1.5": self._internvl_chat_1_5,
+            "InternVL-2.0": self._internvl_2,
+            "Yi-VL-6B": self._yi_vl_6b,
+            "glm-4v-9b": self._glm_4v_9b,
+        }
+        if self.model_name not in model_to_method:
+            raise ValueError(f"尚未为模型 {self.model_name} 实现调用方法。")
+        return model_to_method[self.model_name]()
+
+
+# ====================== main ======================
+
+if __name__ == "__main__":
+    args = get_args()
+
+    print("允许输入的模型名称:")
+    print(list(MODEL_PATH_MAP.keys()))
+    print(f"当前执行的甲骨文任务: {args.task_name} | prompt_type: {args.prompt_type}")
+    print(f"当前使用的模型: {args.model_name}")
+    print(f"数据路径: {args.data_path}")
+    if args.sample is not None:
+        print(f"仅使用前 {args.sample} 条样本评测。")
+
+    runner = ChatModelProcess(
+        model_name=args.model_name,
+        task_name=args.task_name,
+        prompt_type=args.prompt_type,
+        data_path=args.data_path,
+        sample=args.sample,
+        max_new_tokens=args.max_new_tokens,
+    )
+
+    responses = runner.run()
+    if not responses:
+        raise RuntimeError("模型推理没有返回任何结果，请检查。")
+
+    sub_dir = f"{args.task_name}_{args.prompt_type}"
+    out_dir = os.path.join(args.output_dir, sub_dir)
+    create_directory(out_dir)
+
+    out_file = f"{args.model_name}_{args.task_name}_{args.prompt_type}.jsonl"
+    out_path = os.path.join(out_dir, out_file)
+
+    save_as_jsonl(path=out_path, responses=responses, data=runner.used_data)
+    print(f"甲骨文评测结果已保存到: {out_path}")
